@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>在线工具箱 - 图片压缩 · PDF编辑 · 二维码生成</title>
+    <meta name="description" content="一站式在线工具箱，提供图片压缩、图片裁剪、二维码生成、PDF编辑等工具，文件本地处理，隐私安全，完全免费" />
+    <!-- PDF.js v3.11.174：稳定老版本，不依赖 getOrInsertComputed 等 Stage 3 提案，兼容所有浏览器 -->
+    <!-- 通过 <script> 全局加载，彻底绕过 Vite 预构建缓存与 worker 路径解析问题 -->
+    <script src="https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+    <script>
+      // 全局配置 workerSrc，主包与 worker 均锁定同一版本，保证版本与构建类型一致
+      window['pdfjs-dist/build/pdf'].GlobalWorkerOptions.workerSrc =
+        'https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
