@@ -3,6 +3,8 @@ import { PDFDocument, rgb, StandardFonts, pushGraphicsState, popGraphicsState, s
 import fontkit from '@pdf-lib/fontkit';
 import { downloadBlob, formatBytes } from '../../utils/image';
 import { getPdfjsLib } from '../../utils/pdfjs';
+import { useToast } from '../../components/Toast';
+import { ButtonSpinner } from '../../components/Loading';
 import type { PDFDocumentProxy } from '../../utils/pdfjs';
 
 // 单文件大小上限：50MB
@@ -230,12 +232,14 @@ function TextBox({
 // PDFFiller 主组件
 // ============================================================
 export default function PDFFiller() {
+  const { success, error: toastError } = useToast();
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [rendering, setRendering] = useState(false);
   const [saving, setSaving] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const loadingRef = useRef(false);
 
   // PDF 文档与渲染相关
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
@@ -361,12 +365,15 @@ export default function PDFFiller() {
   };
 
   const handleFile = async (f: File) => {
+    if (loadingRef.current || saving) return;
     const err = validateFile(f);
     if (err) {
       setError(err);
+      toastError(err);
       return;
     }
     setError('');
+    loadingRef.current = true;
     setLoading(true);
     // 清理上一个文档
     if (loadingTaskRef.current) {
@@ -393,10 +400,13 @@ export default function PDFFiller() {
       setNumPages(pdf.numPages);
       setCurrentPage(1);
     } catch (e: any) {
-      setError(e?.message || 'PDF 加载失败，请检查文件是否损坏');
+      const msg = e?.message || 'PDF 加载失败，请检查文件是否损坏';
+      setError(msg);
+      toastError(msg);
       setFile(null);
       bytesRef.current = null;
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   };
@@ -483,16 +493,26 @@ export default function PDFFiller() {
 
   // ---- 保存 ----
   const handleSave = async () => {
-    if (!bytesRef.current) {
-      setError('请先上传 PDF 文件');
+    // 先快照源字节与基础名，避免保存期间「更换/重置」导致引用失效
+    const source = bytesRef.current;
+    if (!source) {
+      const msg = '请先上传 PDF 文件';
+      setError(msg);
+      toastError(msg);
       return;
     }
     if (annotations.length === 0) {
-      setError('暂无文本标注可保存');
+      const msg = '暂无文本标注可保存';
+      setError(msg);
+      toastError(msg);
       return;
     }
+    const baseName = file?.name.replace(/\.pdf$/i, '') || 'document';
     setSaving(true);
     setError('');
+    // 字体服务请求超时保护（60s）
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 60000);
     try {
       // 按字体类型分组，每组单独获取子集字体
       const fontFamilyGroups: Record<string, TextAnnotation[]> = {};
@@ -512,6 +532,7 @@ export default function PDFFiller() {
           const resp = await fetch('/api/v1/pdf/subset-font', {
             method: 'POST',
             body: formData,
+            signal: controller.signal,
           });
           if (!resp.ok) {
             const err = await resp.json().catch(() => ({}));
@@ -522,7 +543,7 @@ export default function PDFFiller() {
         })
       );
 
-      const pdfDocLib = await PDFDocument.load(bytesRef.current.slice());
+      const pdfDocLib = await PDFDocument.load(source.slice());
       pdfDocLib.registerFontkit(fontkit);
 
       // 嵌入各字体子集
@@ -582,14 +603,20 @@ export default function PDFFiller() {
         });
       }
       const saved = await pdfDocLib.save();
-      const base = file?.name.replace(/\.pdf$/i, '') || 'document';
       downloadBlob(
         new Blob([new Uint8Array(saved)], { type: 'application/pdf' }),
-        `${base}_标注.pdf`
+        `${baseName}_标注.pdf`
       );
+      success(`保存完成：已写入 ${annotations.length} 条标注`);
     } catch (e: any) {
-      setError(e?.message || '保存失败，请检查标注内容');
+      const msg =
+        e?.name === 'AbortError'
+          ? '字体服务请求超时，请检查网络后重试'
+          : e?.message || '保存失败，请检查标注内容';
+      setError(msg);
+      toastError(msg);
     } finally {
+      window.clearTimeout(timer);
       setSaving(false);
     }
   };
@@ -708,7 +735,8 @@ export default function PDFFiller() {
         </div>
         <button
           onClick={reset}
-          className="text-gray-400 hover:text-red-500 text-xs px-2"
+          disabled={saving || loading}
+          className="text-gray-400 hover:text-red-500 text-xs px-2 py-1 rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-40 disabled:hover:text-gray-400 disabled:hover:bg-transparent"
           title="更换文件"
         >
           更换
@@ -773,7 +801,7 @@ export default function PDFFiller() {
         <div className="ml-auto flex gap-2">
           <button
             onClick={clearAll}
-            disabled={annotations.length === 0}
+            disabled={saving || annotations.length === 0}
             className="btn-ghost text-xs disabled:opacity-40"
           >
             🗑 清空
@@ -783,7 +811,14 @@ export default function PDFFiller() {
             disabled={saving || annotations.length === 0}
             className="btn-primary text-xs disabled:opacity-40"
           >
-            {saving ? '保存中…' : '💾 保存'}
+            {saving ? (
+              <>
+                <ButtonSpinner />
+                保存中…
+              </>
+            ) : (
+              <>💾 保存</>
+            )}
           </button>
         </div>
       </div>
@@ -917,7 +952,8 @@ export default function PDFFiller() {
             {annotations.length > 0 && (
               <button
                 onClick={clearAll}
-                className="mt-2 w-full text-xs text-red-500 hover:text-red-600"
+                disabled={saving}
+                className="mt-2 w-full text-xs text-red-500 hover:text-red-600 disabled:opacity-40"
               >
                 清空全部
               </button>

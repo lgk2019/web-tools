@@ -1,9 +1,11 @@
 // 图片压缩选项
-interface CompressOptions {
+export interface CompressOptions {
   quality: number; // 1-100
   format: 'image/jpeg' | 'image/png' | 'image/webp';
   maxWidth?: number;
   maxHeight?: number;
+  /** 等比缩放系数（如 0.5 = 缩放到 50%），>0 且 ≠1 时生效 */
+  scale?: number;
 }
 
 /**
@@ -13,15 +15,17 @@ export async function compressImage(
   file: File,
   options: CompressOptions
 ): Promise<Blob> {
-  const { quality, format, maxWidth, maxHeight } = options;
+  const { quality, format, maxWidth, maxHeight, scale } = options;
   const img = await loadImage(file);
 
-  let { width, height } = calculateSize(
-    img.width,
-    img.height,
-    maxWidth,
-    maxHeight
-  );
+  // 先按比例缩放，再按最大宽/高收敛，保证输出不超过目标尺寸
+  let { width, height } = scale && scale > 0 && scale !== 1
+    ? {
+        width: Math.max(1, Math.round(img.width * scale)),
+        height: Math.max(1, Math.round(img.height * scale)),
+      }
+    : { width: img.width, height: img.height };
+  ({ width, height } = calculateSize(width, height, maxWidth, maxHeight));
 
   const canvas = document.createElement('canvas');
   canvas.width = width;

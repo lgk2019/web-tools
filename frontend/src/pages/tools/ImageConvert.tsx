@@ -2,6 +2,9 @@ import { useState, useRef, useCallback } from 'react';
 import ToolLayout from '../../components/ToolLayout';
 import { tools } from '../../config/tools';
 import { loadImage, downloadBlob, formatBytes } from '../../utils/image';
+import { useToast } from '../../components/Toast';
+import { ProgressBar, ButtonSpinner } from '../../components/Loading';
+import JSZip from 'jszip';
 
 const tool = tools.find((t) => t.id === 'image-convert')!;
 
@@ -13,6 +16,7 @@ type OutputFormat =
   | 'image/bmp';
 
 interface FileItem {
+  key: string;
   file: File;
   originalSize: number;
   originalFormat: string; // 原始格式短名：JPG / PNG / WebP / BMP ...
@@ -43,30 +47,48 @@ const FORMAT_EXT: Record<OutputFormat, string> = {
   'image/bmp': 'bmp',
 };
 
+// 常见扩展名 → 格式短名（用于 MIME 缺失时兜底识别）
+const FORMAT_EXT_MAP: Record<string, string> = {
+  jpg: 'JPG',
+  jpeg: 'JPG',
+  png: 'PNG',
+  webp: 'WebP',
+  gif: 'GIF',
+  bmp: 'BMP',
+  avif: 'AVIF',
+  ico: 'ICO',
+};
+
+// 判断是否为图片文件（按 MIME 或扩展名兜底，兼容无 MIME 的文件）
+function isImageFile(file: File): boolean {
+  if (file.type.startsWith('image/')) return true;
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  return Object.prototype.hasOwnProperty.call(FORMAT_EXT_MAP, ext);
+}
+
 // 从 MIME 或文件名解析原始格式短名
 function detectFormat(file: File): string {
-  const mime = file.type.toLowerCase();
-  if (mime === 'image/jpeg' || mime === 'image/jpg') return 'JPG';
-  if (mime === 'image/png') return 'PNG';
-  if (mime === 'image/webp') return 'WebP';
-  if (mime === 'image/bmp') return 'BMP';
-  if (mime === 'image/gif') return 'GIF';
-  if (mime === 'image/avif') return 'AVIF';
-  if (mime === 'image/x-icon' || mime === 'image/vnd.microsoft.icon')
-    return 'ICO';
-  // 兜底解析扩展名
-  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-  const map: Record<string, string> = {
-    jpg: 'JPG',
-    jpeg: 'JPG',
-    png: 'PNG',
-    webp: 'WebP',
-    bmp: 'BMP',
-    gif: 'GIF',
-    avif: 'AVIF',
-    ico: 'ICO',
+  const mimeMap: Record<string, string> = {
+    'image/jpeg': 'JPG',
+    'image/jpg': 'JPG',
+    'image/png': 'PNG',
+    'image/webp': 'WebP',
+    'image/bmp': 'BMP',
+    'image/gif': 'GIF',
+    'image/avif': 'AVIF',
+    'image/x-icon': 'ICO',
+    'image/vnd.microsoft.icon': 'ICO',
   };
-  return map[ext] ?? (ext ? ext.toUpperCase() : 'IMG');
+  const mime = file.type.toLowerCase();
+  if (mimeMap[mime]) return mimeMap[mime];
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  return FORMAT_EXT_MAP[ext] ?? (ext ? ext.toUpperCase() : 'IMG');
+}
+
+// 单张图片的压缩率（正数=减小，负数=变大）
+function itemPercent(item: FileItem): number {
+  if (item.originalSize <= 0 || item.convertedSize == null) return 0;
+  return Math.round((1 - item.convertedSize / item.originalSize) * 100);
 }
 
 /**
@@ -164,20 +186,26 @@ export default function ImageConvert() {
   const [format, setFormat] = useState<OutputFormat>('image/webp');
   const [quality, setQuality] = useState(90);
   const [dragging, setDragging] = useState(false);
-  const [toast, setToast] = useState('');
+  const [processing, setProcessing] = useState(false);
+  const [zipping, setZipping] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [lightboxKey, setLightboxKey] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const seqRef = useRef(0);
+  const { success, error: toastError, warning } = useToast();
 
-  // 闪现提示
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    window.setTimeout(() => setToast(''), 2500);
-  }, []);
+  const makeKey = useCallback(
+    (file: File) =>
+      `${file.name}-${file.size}-${file.lastModified}-${++seqRef.current}`,
+    []
+  );
 
   const addFiles = useCallback(
     (fileList: FileList) => {
-      const incoming = Array.from(fileList).filter((f) =>
-        f.type.startsWith('image/')
-      );
+      if (processing) return;
+      const all = Array.from(fileList);
+      const incoming = all.filter(isImageFile);
+      const skipped = all.length - incoming.length;
 
       let oversized = 0;
       const valid = incoming.filter((f) => {
@@ -193,14 +221,18 @@ export default function ImageConvert() {
         const accepted = valid.slice(0, remaining);
         const overflow = valid.length - accepted.length;
 
+        if (skipped > 0) {
+          warning(`已跳过 ${skipped} 个非图片文件`);
+        }
         if (oversized > 0) {
-          showToast(`已跳过 ${oversized} 个超过 20MB 的文件`);
+          warning(`已跳过 ${oversized} 个超过 20MB 的文件`);
         }
         if (overflow > 0) {
-          showToast(`已达上限 ${MAX_FILES} 张，部分文件未加入`);
+          warning(`已达上限 ${MAX_FILES} 张，部分文件未加入`);
         }
 
         const newItems: FileItem[] = accepted.map((file) => ({
+          key: makeKey(file),
           file,
           originalSize: file.size,
           originalFormat: detectFormat(file),
@@ -210,20 +242,21 @@ export default function ImageConvert() {
         return [...prev, ...newItems];
       });
     },
-    [showToast]
+    [processing, makeKey, warning]
   );
 
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       setDragging(false);
-      if (e.dataTransfer.files) addFiles(e.dataTransfer.files);
+      if (!processing && e.dataTransfer.files) addFiles(e.dataTransfer.files);
     },
-    [addFiles]
+    [processing, addFiles]
   );
 
   // 切换格式 / 质量时清空已转换结果，避免结果与新参数错配
   const clearResults = useCallback(() => {
+    setLightboxKey(null);
     setFiles((prev) => {
       prev.forEach((f) => f.previewUrl && URL.revokeObjectURL(f.previewUrl));
       return prev.map((f) => ({
@@ -239,46 +272,58 @@ export default function ImageConvert() {
 
   const changeFormat = useCallback(
     (f: OutputFormat) => {
+      if (processing) return;
       if (f === format) return;
       setFormat(f);
       clearResults();
     },
-    [format, clearResults]
+    [processing, format, clearResults]
   );
 
   const changeQuality = useCallback(
     (q: number) => {
+      if (processing) return;
       setQuality(q);
       clearResults();
     },
-    [clearResults]
+    [processing, clearResults]
   );
 
-  const removeFile = (index: number) => {
+  const removeFile = (item: FileItem) => {
     setFiles((prev) => {
-      const target = prev[index];
+      const target = prev.find((f) => f.key === item.key);
       if (target) {
         URL.revokeObjectURL(target.thumbUrl);
         if (target.previewUrl) URL.revokeObjectURL(target.previewUrl);
       }
-      return prev.filter((_, i) => i !== index);
+      return prev.filter((f) => f.key !== item.key);
     });
   };
 
+  // 转换单个文件（按 item.key 定位，避免索引错位）
   const convertOne = useCallback(
-    async (index: number) => {
-      // 先标记为处理中
+    async (item: FileItem): Promise<boolean> => {
       setFiles((prev) =>
-        prev.map((f, i) => (i === index ? { ...f, status: 'processing' } : f))
+        prev.map((f) => {
+          if (f.key !== item.key) return f;
+          // 先释放旧预览，防止重复转换时 objectURL 泄漏
+          if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+          return {
+            ...f,
+            convertedBlob: undefined,
+            convertedSize: undefined,
+            previewUrl: undefined,
+            status: 'processing' as const,
+            error: undefined,
+          };
+        })
       );
-      const item = files[index];
-      if (!item) return;
       try {
         const blob = await convertImage(item.file, format, quality);
         const previewUrl = URL.createObjectURL(blob);
         setFiles((prev) =>
-          prev.map((f, i) =>
-            i === index
+          prev.map((f) =>
+            f.key === item.key
               ? {
                   ...f,
                   convertedBlob: blob,
@@ -290,73 +335,144 @@ export default function ImageConvert() {
               : f
           )
         );
+        return true;
       } catch {
         setFiles((prev) =>
-          prev.map((f, i) =>
-            i === index
-              ? { ...f, status: 'error', error: '转换失败' }
+          prev.map((f) =>
+            f.key === item.key
+              ? { ...f, status: 'error', error: '图片无法解析或转换失败' }
               : f
           )
         );
+        return false;
       }
     },
-    [files, format, quality]
+    [format, quality]
   );
 
-  const convertAll = useCallback(async () => {
-    for (let i = 0; i < files.length; i++) {
-      if (files[i].status !== 'done') {
-        await convertOne(i);
+  // 依次转换指定文件（内部锁定进度，防止重复触发）
+  const runConvert = useCallback(
+    async (targetItems: FileItem[]) => {
+      if (processing || targetItems.length === 0) return;
+      setProcessing(true);
+      setProgress({ done: 0, total: targetItems.length });
+      let ok = 0;
+      let fail = 0;
+      for (const item of targetItems) {
+        const succeed = await convertOne(item);
+        if (succeed) ok++;
+        else fail++;
+        setProgress((p) => ({ ...p, done: p.done + 1 }));
       }
-    }
-  }, [files, convertOne]);
+      setProcessing(false);
+      setProgress({ done: 0, total: 0 });
+      if (fail === 0) {
+        success(`转换完成：共 ${ok} 张`);
+      } else {
+        warning(`转换完成：成功 ${ok} 张，失败 ${fail} 张，可点击重试`);
+      }
+    },
+    [processing, convertOne, success, warning]
+  );
 
-  const downloadOne = (index: number) => {
-    const item = files[index];
+  const convertAll = useCallback(() => {
+    const targets = files.filter(
+      (f) => f.status === 'pending' || f.status === 'error'
+    );
+    runConvert(targets);
+  }, [files, runConvert]);
+
+  const retryOne = useCallback(
+    (item: FileItem) => {
+      if (processing) return;
+      runConvert([item]);
+    },
+    [processing, runConvert]
+  );
+
+  const downloadOne = (item: FileItem) => {
     if (!item?.convertedBlob) return;
-    const name =
-      item.file.name.replace(/\.[^.]+$/, '') + '.' + FORMAT_EXT[format];
-    downloadBlob(item.convertedBlob, name);
+    const base = item.file.name.replace(/\.[^.]+$/, '') || 'image';
+    downloadBlob(item.convertedBlob, `${base}.${FORMAT_EXT[format]}`);
   };
 
-  const downloadAll = () => {
-    files.forEach((_, i) => {
-      if (files[i].status === 'done') downloadOne(i);
-    });
-  };
+  // 批量打包 ZIP 下载（避免浏览器拦截逐张下载）
+  const downloadZip = useCallback(async () => {
+    const doneItems = files.filter((f) => f.status === 'done' && f.convertedBlob);
+    if (doneItems.length === 0 || zipping || processing) return;
+    setZipping(true);
+    try {
+      const zip = new JSZip();
+      const folder = zip.folder('转换图片');
+      const usedNames = new Set<string>();
+      for (const item of doneItems) {
+        const base = item.file.name.replace(/\.[^.]+$/, '') || 'image';
+        const ext = FORMAT_EXT[format];
+        let name = `${base}.${ext}`;
+        let n = 2;
+        while (usedNames.has(name)) {
+          name = `${base}(${n++}).${ext}`;
+        }
+        usedNames.add(name);
+        folder!.file(name, item.convertedBlob!);
+      }
+      const content = await zip.generateAsync({ type: 'blob' });
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')
+        .slice(0, 19);
+      downloadBlob(content, `图片转换-${stamp}.zip`);
+      success(`已打包下载 ${doneItems.length} 张图片`);
+    } catch {
+      toastError('打包失败，请重试');
+    } finally {
+      setZipping(false);
+    }
+  }, [files, format, zipping, processing, success, toastError]);
 
   const reset = () => {
+    if (processing) return;
     files.forEach((f) => {
       URL.revokeObjectURL(f.thumbUrl);
       if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
     });
     setFiles([]);
+    setLightboxKey(null);
+    setProgress({ done: 0, total: 0 });
   };
 
-  const doneCount = files.filter((f) => f.status === 'done').length;
-  const totalOriginal = files.reduce((sum, f) => sum + f.originalSize, 0);
-  const totalConverted = files.reduce(
+  const doneItems = files.filter((f) => f.status === 'done');
+  const pendingCount = files.filter(
+    (f) => f.status === 'pending' || f.status === 'error'
+  ).length;
+  const doneCount = doneItems.length;
+  const totalOriginal = doneItems.reduce((sum, f) => sum + f.originalSize, 0);
+  const totalConverted = doneItems.reduce(
     (sum, f) => sum + (f.convertedSize ?? 0),
     0
   );
+  const savedBytes = totalOriginal - totalConverted;
   const savedPercent =
     totalOriginal > 0
-      ? Math.round((1 - totalConverted / totalOriginal) * 100)
+      ? Math.round((savedBytes / totalOriginal) * 100)
       : 0;
 
   // 仅 JPG / WebP 显示质量滑块
   const showQuality =
     format === 'image/jpeg' || format === 'image/webp';
+  const progressPercent =
+    progress.total > 0
+      ? Math.round((progress.done / progress.total) * 100)
+      : 0;
+
+  // 放大预览对象
+  const lightboxItem =
+    lightboxKey != null
+      ? files.find((f) => f.key === lightboxKey && f.previewUrl)
+      : undefined;
 
   return (
     <ToolLayout tool={tool}>
-      {/* 全局提示 */}
-      {toast && (
-        <div className="mb-4 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          {toast}
-        </div>
-      )}
-
       <div className="grid md:grid-cols-2 gap-6">
         {/* 左侧：上传与参数 */}
         <div className="space-y-4">
@@ -367,19 +483,23 @@ export default function ImageConvert() {
             </label>
             <div
               onDragOver={(e) => {
+                if (processing) return;
                 e.preventDefault();
                 setDragging(true);
               }}
               onDragLeave={() => setDragging(false)}
               onDrop={onDrop}
-              onClick={() => inputRef.current?.click()}
-              className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors ${
-                dragging
-                  ? 'border-brand-500 bg-brand-50 dark:bg-brand-900/20'
-                  : 'border-gray-300 dark:border-gray-700 hover:border-brand-400'
+              onClick={() => !processing && inputRef.current?.click()}
+              className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+                processing
+                  ? 'opacity-50 pointer-events-none border-gray-200 dark:border-gray-700'
+                  : 'cursor-pointer ' +
+                    (dragging
+                      ? 'border-brand-500 bg-brand-50 dark:bg-brand-900/20'
+                      : 'border-gray-300 dark:border-gray-700 hover:border-brand-400')
               }`}
             >
-              <div className="text-3xl mb-2">🔄</div>
+              <div className="text-3xl mb-2">📤</div>
               <p className="font-medium text-sm">拖拽图片至此 或 点击选择</p>
               <p className="text-xs text-gray-400 mt-1">
                 支持 JPG / PNG / WebP / BMP · 单文件 ≤ 20MB · 最多 20 张
@@ -401,54 +521,81 @@ export default function ImageConvert() {
           {/* 文件列表 */}
           {files.length > 0 && (
             <div className="space-y-2 max-h-64 overflow-y-auto">
-              {files.map((item, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-2 rounded-lg bg-gray-50 dark:bg-gray-800 p-2"
-                >
-                  <img
-                    src={item.thumbUrl}
-                    alt={item.file.name}
-                    className="w-10 h-10 rounded object-cover bg-white dark:bg-gray-900 shrink-0"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-medium truncate">
-                      {item.file.name}
-                    </p>
-                    <p className="text-xs text-gray-400 flex items-center gap-1.5">
-                      <span className="tag bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0">
-                        {item.originalFormat}
-                      </span>
-                      <span>{formatBytes(item.originalSize)}</span>
-                      {item.convertedSize !== undefined && (
-                        <span className="text-emerald-600">
-                          → {formatBytes(item.convertedSize)}
-                        </span>
-                      )}
-                      {item.status === 'processing' && (
-                        <span className="text-brand-600">转换中…</span>
-                      )}
-                      {item.status === 'error' && (
-                        <span className="text-red-500">{item.error}</span>
-                      )}
-                    </p>
-                  </div>
-                  {item.status === 'done' && (
-                    <button
-                      onClick={() => downloadOne(i)}
-                      className="text-xs text-brand-600 hover:underline shrink-0"
-                    >
-                      下载
-                    </button>
-                  )}
-                  <button
-                    onClick={() => removeFile(i)}
-                    className="text-gray-400 hover:text-red-500 shrink-0"
+              {files.map((item) => {
+                const pct = itemPercent(item);
+                return (
+                  <div
+                    key={item.key}
+                    className="flex items-center gap-2 rounded-lg bg-gray-50 dark:bg-gray-800 p-2"
                   >
-                    ✕
-                  </button>
-                </div>
-              ))}
+                    <img
+                      src={item.thumbUrl}
+                      alt={item.file.name}
+                      className="w-10 h-10 rounded object-cover bg-white dark:bg-gray-900 shrink-0"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium truncate">
+                        {item.file.name}
+                      </p>
+                      <p className="text-xs text-gray-400 flex items-center gap-1.5 flex-wrap">
+                        <span className="tag bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300 px-1.5 py-0">
+                          {item.originalFormat}
+                        </span>
+                        {item.status === 'pending' && (
+                          <span>待转换 · {formatBytes(item.originalSize)}</span>
+                        )}
+                        {item.status === 'processing' && (
+                          <span className="text-brand-600 flex items-center gap-1">
+                            <span className="inline-block w-3 h-3 border-2 border-brand-600 border-t-transparent rounded-full animate-spin" />
+                            转换中…
+                          </span>
+                        )}
+                        {item.status === 'done' && (
+                          <span>
+                            {formatBytes(item.originalSize)}
+                            <span className="text-emerald-600 mx-0.5">
+                              → {formatBytes(item.convertedSize ?? 0)}
+                            </span>
+                            <span
+                              className={
+                                pct >= 0 ? 'text-emerald-600' : 'text-amber-600'
+                              }
+                            >
+                              （{pct >= 0 ? `${pct}% ↓` : `${Math.abs(pct)}% ↑`}）
+                            </span>
+                          </span>
+                        )}
+                        {item.status === 'error' && (
+                          <span className="text-red-500">{item.error}</span>
+                        )}
+                      </p>
+                    </div>
+                    {item.status === 'done' && (
+                      <button
+                        onClick={() => downloadOne(item)}
+                        className="text-xs text-brand-600 hover:underline shrink-0"
+                      >
+                        下载
+                      </button>
+                    )}
+                    {item.status === 'error' && (
+                      <button
+                        onClick={() => retryOne(item)}
+                        className="text-xs text-brand-600 hover:underline shrink-0"
+                      >
+                        重试
+                      </button>
+                    )}
+                    <button
+                      onClick={() => removeFile(item)}
+                      disabled={processing}
+                      className="text-gray-400 hover:text-red-500 shrink-0 disabled:opacity-40"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -472,8 +619,9 @@ export default function ImageConvert() {
                 ).map((f) => (
                   <button
                     key={f}
+                    disabled={processing}
                     onClick={() => changeFormat(f)}
-                    className={`flex-1 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                    className={`flex-1 py-1.5 rounded-md text-xs font-medium transition-colors disabled:opacity-50 ${
                       format === f
                         ? 'bg-white dark:bg-gray-900 text-brand-600 shadow-sm'
                         : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
@@ -499,8 +647,9 @@ export default function ImageConvert() {
                   min="1"
                   max="100"
                   value={quality}
+                  disabled={processing}
                   onChange={(e) => changeQuality(Number(e.target.value))}
-                  className="w-full accent-brand-600"
+                  className="w-full accent-brand-600 disabled:opacity-50"
                 />
                 <p className="text-xs text-gray-400 mt-1">
                   数值越高画质越好，文件也越大。
@@ -519,15 +668,24 @@ export default function ImageConvert() {
           <div className="flex gap-2">
             <button
               onClick={convertAll}
-              disabled={files.length === 0}
-              className="btn-primary flex-1"
+              disabled={
+                files.length === 0 || pendingCount === 0 || processing
+              }
+              className="btn-primary flex-1 disabled:opacity-60"
             >
-              🔄 转换全部（{files.length}）
+              {processing ? (
+                <>
+                  <ButtonSpinner />
+                  处理中（{progress.done}/{progress.total}）
+                </>
+              ) : (
+                <>🔄 转换全部（{pendingCount}）</>
+              )}
             </button>
             <button
               onClick={reset}
-              disabled={files.length === 0}
-              className="btn-ghost"
+              disabled={files.length === 0 || processing}
+              className="btn-ghost disabled:opacity-60"
             >
               重置
             </button>
@@ -549,18 +707,19 @@ export default function ImageConvert() {
               {/* 统计卡片 */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="card p-3 text-center">
-                  <p className="text-xs text-gray-400 mb-1">原始大小</p>
+                  <p className="text-xs text-gray-400 mb-1">转换后大小</p>
                   <p className="text-lg font-bold font-mono">
-                    {formatBytes(totalOriginal)}
+                    {doneCount > 0 ? formatBytes(totalConverted) : '—'}
                   </p>
+                  {doneCount > 0 && (
+                    <p className="text-[10px] text-gray-400 mt-0.5">
+                      {savedBytes >= 0
+                        ? `节省 ${formatBytes(savedBytes)}`
+                        : `增加 ${formatBytes(-savedBytes)}`}
+                    </p>
+                  )}
                 </div>
                 <div className="card p-3 text-center border-brand-500">
-                  <p className="text-xs text-gray-400 mb-1">转换后</p>
-                  <p className="text-lg font-bold font-mono text-brand-600">
-                    {formatBytes(totalConverted)}
-                  </p>
-                </div>
-                <div className="card p-3 text-center">
                   <p className="text-xs text-gray-400 mb-1">
                     {savedPercent >= 0 ? '节省' : '增加'}
                   </p>
@@ -569,60 +728,154 @@ export default function ImageConvert() {
                       savedPercent >= 0 ? 'text-emerald-600' : 'text-amber-600'
                     }`}
                   >
-                    {Math.abs(savedPercent)}%
+                    {doneCount > 0 ? `${Math.abs(savedPercent)}%` : '—'}
+                  </p>
+                </div>
+                <div className="card p-3 text-center">
+                  <p className="text-xs text-gray-400 mb-1">完成</p>
+                  <p className="text-lg font-bold font-mono text-brand-600">
+                    {doneCount}
+                    <span className="text-sm text-gray-400 font-normal">
+                      /{files.length}
+                    </span>
                   </p>
                 </div>
               </div>
 
+              {/* 处理进度 */}
+              {processing && (
+                <div className="rounded-lg bg-gray-50 dark:bg-gray-800 p-3 space-y-2">
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>正在转换…</span>
+                    <span className="font-mono text-brand-600">
+                      {progress.done}/{progress.total}（{progressPercent}%）
+                    </span>
+                  </div>
+                  <ProgressBar value={progressPercent} />
+                </div>
+              )}
+
               {/* 结果列表 */}
               <div className="space-y-3 max-h-80 overflow-y-auto">
-                {files
-                  .map((item, i) => ({ item, i }))
-                  .filter(({ item }) => item.status === 'done')
-                  .map(({ item, i }) => {
-                    const pct =
-                      item.originalSize > 0
-                        ? Math.round(
-                            (1 -
-                              (item.convertedSize ?? 0) / item.originalSize) *
-                              100
-                          )
-                        : 0;
-                    return (
-                      <div key={i} className="card p-3">
+                {doneItems.map((item) => {
+                  const pct = itemPercent(item);
+                  const base =
+                    item.file.name.replace(/\.[^.]+$/, '') || 'image';
+                  return (
+                    <div key={item.key} className="card p-3">
+                      <button
+                        type="button"
+                        onClick={() => setLightboxKey(item.key)}
+                        className="relative block w-full mb-2 group"
+                        aria-label={`放大预览 ${item.file.name}`}
+                      >
                         <img
                           src={item.previewUrl}
                           alt={item.file.name}
-                          className="w-full rounded-lg mb-2 max-h-40 object-contain bg-gray-50 dark:bg-gray-800"
+                          className="w-full rounded-lg max-h-40 object-contain bg-gray-50 dark:bg-gray-800"
                         />
-                        <div className="flex justify-between items-center text-xs gap-2">
-                          <span className="truncate">
-                            {item.file.name.replace(/\.[^.]+$/, '')}.
-                            {FORMAT_EXT[format]}
-                          </span>
-                          <span
-                            className={`font-medium shrink-0 ${
-                              pct >= 0 ? 'text-emerald-600' : 'text-amber-600'
-                            }`}
-                          >
-                            {pct >= 0 ? `${pct}% ↓` : `${Math.abs(pct)}% ↑`}
-                          </span>
-                        </div>
+                        <span className="absolute inset-0 rounded-lg flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/30 text-white text-xs font-medium">
+                          🔍 点击放大预览
+                        </span>
+                      </button>
+                      <div className="flex justify-between items-center text-xs gap-2">
+                        <span className="truncate">
+                          {base}.{FORMAT_EXT[format]}
+                        </span>
+                        <span
+                          className={`font-medium shrink-0 ${
+                            pct >= 0 ? 'text-emerald-600' : 'text-amber-600'
+                          }`}
+                        >
+                          {pct >= 0
+                            ? `${formatBytes(item.convertedSize ?? 0)}（${pct}% ↓）`
+                            : `${formatBytes(item.convertedSize ?? 0)}（${Math.abs(pct)}% ↑）`}
+                        </span>
                       </div>
-                    );
-                  })}
+                      <div className="mt-2 flex gap-3">
+                        <button
+                          onClick={() => downloadOne(item)}
+                          className="text-xs text-brand-600 hover:underline"
+                        >
+                          ⬇ 下载
+                        </button>
+                        <button
+                          onClick={() => setLightboxKey(item.key)}
+                          className="text-xs text-gray-500 dark:text-gray-400 hover:text-brand-600"
+                        >
+                          🔍 放大
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
 
-              {/* 全部下载 */}
+              {/* 全部打包下载 */}
               {doneCount > 0 && (
-                <button onClick={downloadAll} className="btn-primary w-full">
-                  ⬇️ 全部下载（{doneCount}）
+                <button
+                  onClick={downloadZip}
+                  disabled={zipping || processing}
+                  className="btn-primary w-full disabled:opacity-60"
+                >
+                  {zipping ? (
+                    <>
+                      <ButtonSpinner />
+                      正在打包…
+                    </>
+                  ) : (
+                    <>📦 打包下载全部（{doneCount}）</>
+                  )}
                 </button>
               )}
             </>
           )}
         </div>
       </div>
+
+      {/* 放大预览弹窗 */}
+      {lightboxItem && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fade-in"
+          onClick={() => setLightboxKey(null)}
+        >
+          <div
+            className="relative max-w-3xl w-full rounded-xl bg-white dark:bg-gray-900 shadow-card overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-gray-100 dark:border-gray-800">
+              <span className="text-sm font-medium truncate">
+                {lightboxItem.file.name.replace(/\.[^.]+$/, '')}.
+                {FORMAT_EXT[format]}
+              </span>
+              <button
+                onClick={() => setLightboxKey(null)}
+                className="text-gray-400 hover:text-red-500 shrink-0"
+                aria-label="关闭预览"
+              >
+                ✕
+              </button>
+            </div>
+            <img
+              src={lightboxItem.previewUrl}
+              alt={lightboxItem.file.name}
+              className="w-full max-h-[70vh] object-contain p-3 bg-gray-50 dark:bg-gray-800"
+            />
+            <div className="flex justify-between items-center px-4 py-3 border-t border-gray-100 dark:border-gray-800">
+              <span className="text-xs text-gray-400">
+                {lightboxItem.originalFormat} → {FORMAT_LABEL[format]} ·{' '}
+                {formatBytes(lightboxItem.convertedSize ?? 0)}
+              </span>
+              <button
+                onClick={() => downloadOne(lightboxItem)}
+                className="btn-primary !py-1.5 !text-sm"
+              >
+                ⬇ 下载
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </ToolLayout>
   );
 }
