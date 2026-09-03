@@ -134,6 +134,37 @@ export const tools: ToolConfig[] = [
     backend: false,
     tags: ['PDF', '图片', '转换', 'PNG'],
   },
+  {
+    id: 'password-generator',
+    name: '密码生成器',
+    category: 'text',
+    icon: '🔑',
+    description: '生成安全随机密码，自定义长度与字符类型',
+    path: '/tool/password-generator',
+    backend: false,
+    tags: ['密码', '随机', '安全', '生成'],
+    popular: true,
+  },
+  {
+    id: 'uuid-generator',
+    name: 'UUID 生成器',
+    category: 'text',
+    icon: '🆔',
+    description: '批量生成 UUID v4，支持多种格式',
+    path: '/tool/uuid-generator',
+    backend: false,
+    tags: ['UUID', 'GUID', 'v4', '生成'],
+  },
+  {
+    id: 'hash-generator',
+    name: '哈希生成器',
+    category: 'text',
+    icon: '#️⃣',
+    description: '计算 SHA-1/256/384/512 哈希值',
+    path: '/tool/hash-generator',
+    backend: false,
+    tags: ['哈希', 'SHA', 'SHA-256', '摘要'],
+  },
 ];
 
 // 按分类获取工具

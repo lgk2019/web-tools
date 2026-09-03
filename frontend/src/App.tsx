@@ -13,6 +13,9 @@ import Base64Tool from './pages/tools/Base64Tool';
 import QRReader from './pages/tools/QRReader';
 import PDFToImage from './pages/tools/PDFToImage';
 import WatermarkRemover from './pages/tools/WatermarkRemover';
+import PasswordGenerator from './pages/tools/PasswordGenerator';
+import UuidGenerator from './pages/tools/UuidGenerator';
+import HashGenerator from './pages/tools/HashGenerator';
 
 export default function App() {
   return (
@@ -30,6 +33,9 @@ export default function App() {
         <Route path="/tool/qr-reader" element={<QRReader />} />
         <Route path="/tool/pdf-to-image" element={<PDFToImage />} />
         <Route path="/tool/watermark-remover" element={<WatermarkRemover />} />
+        <Route path="/tool/password-generator" element={<PasswordGenerator />} />
+        <Route path="/tool/uuid-generator" element={<UuidGenerator />} />
+        <Route path="/tool/hash-generator" element={<HashGenerator />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
     </Layout>
